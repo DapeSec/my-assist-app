@@ -1,6 +1,6 @@
 {
-  "short_name": "React App",
-  "name": "Create React App Sample",
+  "short_name": "CodeAssist",
+  "name": "Helping people code better",
   "icons": [
     {
       "src": "favicon.ico",
