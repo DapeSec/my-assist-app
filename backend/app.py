@@ -4,6 +4,7 @@ import os
 from dotenv import load_dotenv
 import requests
 import re
+import json # Import json for parsing potential tool output
 
 # Import LangChain components
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -39,6 +40,7 @@ ticketmaster_api_key = os.environ.get("TICKETMASTER_API_KEY")
 anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
 openai_api_key = os.environ.get("OPENAI_API_KEY")
 deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY")
+alpha_vantage_api_key = os.environ.get("ALPHA_VANTAGE_API_KEY") # Alpha Vantage API Key
 
 # --- API Key Validation ---
 if not google_api_key:
@@ -51,6 +53,8 @@ if not deepseek_api_key:
     print("Warning: DEEPSEEK_API_KEY environment variable not set. DeepSeek LLM for code generation will not be available.")
 if not ticketmaster_api_key:
      print("Warning: TICKETMASTER_API_KEY environment variable not set. Ticketmaster tool will not be available.")
+if not alpha_vantage_api_key: # Validation for Alpha Vantage API Key
+    print("Warning: ALPHA_VANTAGE_API_KEY environment variable not set. Financial data and analysis tools will not be available.")
 
 
 # --- Initialize LLMs ---
@@ -151,6 +155,135 @@ def search_ticketmaster_events(query: str) -> str:
     except Exception as e:
         print(f"An unexpected error occurred processing Ticketmaster data: {e}")
         return f"An unexpected error occurred while processing event data for '{query}'."
+
+# --- Define Financial Data Tool ---
+def get_stock_data(symbol: str) -> str:
+    """
+    Fetches real-time stock data for a given stock ticker symbol using Alpha Vantage.
+    Returns a formatted string summary of the stock's current price and other metrics.
+    """
+    if not alpha_vantage_api_key:
+        return "Alpha Vantage API key is not set. Cannot fetch stock data."
+
+    base_url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "GLOBAL_QUOTE",
+        "symbol": symbol.upper(),
+        "apikey": alpha_vantage_api_key
+    }
+
+    try:
+        response = requests.get(base_url, params=params)
+        response.raise_for_status() # Raise an exception for HTTP errors
+        data = response.json()
+
+        global_quote = data.get("Global Quote", {})
+        if not global_quote:
+            return f"No real-time data found for stock symbol '{symbol}'. It might be an invalid symbol or data is not available."
+
+        # Extract relevant data
+        symbol_out = global_quote.get("01. symbol", "N/A")
+        open_price = global_quote.get("02. open", "N/A")
+        high_price = global_quote.get("03. high", "N/A")
+        low_price = global_quote.get("04. low", "N/A")
+        price = global_quote.get("05. price", "N/A")
+        volume = global_quote.get("06. volume", "N/A")
+        latest_trading_day = global_quote.get("07. latest trading day", "N/A")
+        previous_close = global_quote.get("08. previous close", "N/A")
+        change = global_quote.get("09. change", "N/A")
+        change_percent = global_quote.get("10. change percent", "N/A")
+
+        # Return as a JSON string to make parsing easier for analysis tool
+        return json.dumps({
+            "symbol": symbol_out,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "price": price,
+            "volume": volume,
+            "latest_trading_day": latest_trading_day,
+            "previous_close": previous_close,
+            "change": change,
+            "change_percent": change_percent
+        })
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Alpha Vantage API for {symbol}: {e}")
+        return json.dumps({"error": f"An error occurred while fetching stock data for '{symbol}'. Please try again later."})
+    except Exception as e:
+        print(f"An unexpected error occurred processing Alpha Vantage data for {symbol}: {e}")
+        return json.dumps({"error": f"An unexpected error occurred while processing stock data for '{symbol}'."})
+
+# --- Define Stock Analysis Tool ---
+def analyze_stock(symbol: str) -> str:
+    """
+    Analyzes real-time stock data for a given stock ticker symbol.
+    Fetches data using the Financial Data tool and provides a brief analysis.
+    Input should be a stock ticker symbol, e.g., 'AAPL'.
+    """
+    # Use the get_stock_data function to fetch the raw data
+    raw_data_json = get_stock_data(symbol)
+
+    try:
+        data = json.loads(raw_data_json)
+
+        if "error" in data:
+            return f"Could not analyze stock {symbol}: {data['error']}"
+        if not data or data.get("symbol") == "N/A":
+             return f"Could not analyze stock {symbol}: No data found or invalid symbol."
+
+        symbol_out = data.get("symbol", "N/A")
+        price = float(data.get("price", 0))
+        open_price = float(data.get("open", 0))
+        high_price = float(data.get("high", 0))
+        low_price = float(data.get("low", 0))
+        previous_close = float(data.get("previous_close", 0))
+        change = float(data.get("change", 0))
+        change_percent_str = data.get("change_percent", "0%")
+        volume = data.get("volume", "N/A")
+        latest_trading_day = data.get("latest_trading_day", "N/A")
+
+        # Basic Analysis
+        analysis_report = f"Analysis for {symbol_out} (as of {latest_trading_day}):\n"
+        analysis_report += f"  Current Price: ${price:.2f}\n"
+        analysis_report += f"  Change Today: {change:.2f} ({change_percent_str})\n"
+
+        if previous_close != 0:
+            if price > previous_close:
+                analysis_report += "  The stock is trading higher than its previous close.\n"
+            elif price < previous_close:
+                analysis_report += "  The stock is trading lower than its previous close.\n"
+            else:
+                analysis_report += "  The stock is trading at the same price as its previous close.\n"
+
+        price_range = high_price - low_price
+        if price_range > 0:
+            # Calculate position within the day's range
+            position_in_range = (price - low_price) / price_range
+            if position_in_range > 0.75:
+                analysis_report += "  It is currently trading near the high of the day.\n"
+            elif position_in_range < 0.25:
+                analysis_report += "  It is currently trading near the low of the day.\n"
+            else:
+                analysis_report += "  It is trading within the mid-range of the day.\n"
+        else:
+             analysis_report += "  High and low prices for the day are the same.\n"
+
+
+        analysis_report += f"  Volume: {volume}\n"
+        # Add a disclaimer
+        analysis_report += "\nDisclaimer: This analysis is based on real-time data and provides a snapshot of the stock's performance today. It is not financial advice. Consult a qualified financial advisor for personalized investment recommendations."
+
+        return analysis_report
+
+    except json.JSONDecodeError:
+        return f"Error processing financial data for {symbol}."
+    except ValueError:
+        return f"Error converting data to numbers for analysis for {symbol}. Data might be incomplete or malformed."
+    except Exception as e:
+        print(f"An unexpected error occurred during stock analysis for {symbol}: {e}")
+        return f"An unexpected error occurred while analyzing stock data for '{symbol}'."
+
 
 # --- Define Code Generation Tool Function ---
 def generate_code_from_multiple_models(prompt: str) -> str:
@@ -265,6 +398,20 @@ tools.append(Tool(
     func=pubmed.run,
     description="useful for when you need to answer questions about medical literature, health, and biomedical topics. Input should be a medical query like 'causes of diabetes' or 'treatment for migraines'."
 ))
+if alpha_vantage_api_key: # Add Financial Data and Analysis Tools
+    tools.append(Tool(
+        name="Financial Data",
+        func=get_stock_data,
+        description="useful for getting real-time stock market data for a given ticker symbol. Input should be a stock ticker symbol, e.g., 'AAPL' or 'MSFT'. Returns raw JSON data."
+    ))
+    tools.append(Tool(
+        name="Stock Analyzer",
+        func=analyze_stock,
+        description="useful for analyzing real-time stock market data for a given ticker symbol and providing a brief summary. Input should be a stock ticker symbol, e.g., 'AAPL' or 'MSFT'."
+    ))
+else:
+    print("Warning: Alpha Vantage API key is missing. Financial Data and Stock Analyzer tools will not be available.")
+
 # Add the Code Generator tool if at least one code generation model is available
 if llm_gemini or llm_claude or llm_openai or llm_deepseek:
      tools.append(Tool(
@@ -276,7 +423,7 @@ else:
     print("Warning: No code generation models (Gemini, Claude, OpenAI, DeepSeek) are available. Code Generator tool will not be added.")
 
 
-# Updated base prefix to reinforce the multi-model nature of the code tool
+# Updated base prefix to reinforce the multi-model nature of the code tool, financial data, and analysis
 base_personalized_prefix = """You are a helpful AI assistant with access to several tools to assist users with their queries.
 You are designed to be friendly and informative.
 You respond in a witty and playful tone.
@@ -285,6 +432,9 @@ When asked about live events like concerts or sports, use the Ticketmaster Event
 When asked about medical or health-related topics, use the PubMed Search tool.
 When the user explicitly asks for code or a script, use the Code Generator tool. The input to the Code Generator should be the user's request for the code. This tool provides code results from multiple models (Gemini, Claude, OpenAI, DeepSeek).
 When you use the Code Generator tool, you will receive output containing code generated by the available models, clearly labeled. Present ALL the code results you receive from the tool to the user. Before listing the code blocks, provide a brief explanation of the potential differences or characteristics you observe between the code generated by the different models, if multiple results are available. You can comment on style, structure, approach, or any other notable variations.
+When the user asks for *real-time financial data* for a specific stock, use the Financial Data tool. The input should be a stock ticker symbol (e.g., 'AAPL').
+When the user asks for an *analysis* or *insights* about a specific stock based on real-time data, use the Stock Analyzer tool. The input should be a stock ticker symbol (e.g., 'AAPL').
+When the user asks for *general financial advice* (e.g., "Should I invest in X?", "What's a good investment strategy?", "How do I save for retirement?"), leverage the Google Search tool to find general, reliable financial advice, and then summarize it. **Crucially, explicitly state that you are an AI and cannot provide personalized financial advice, and that they should consult a qualified financial advisor for their specific situation.**
 Always try to provide a concise and helpful answer based on the information you find or generate.
 
 Conversation History:
