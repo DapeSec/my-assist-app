@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 import requests
 import re
 import json # Import json for parsing potential tool output
+from typing import Union, Dict, Any # Import Union, Dict, Any for type hinting compatibility
+import time # Import time for rate limiting
 
 # Import LangChain components
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -14,9 +16,13 @@ from langchain_community.utilities import GoogleSearchAPIWrapper
 from langchain_community.tools import PubmedQueryRun
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate # For YouTube summarization prompt
 
 # Import BaseCallbackHandler for capturing agent thoughts
 from langchain_core.callbacks import BaseCallbackHandler
+
+# Import for YouTube Transcript API
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
 try:
     from langchain_deepseek import ChatDeepseek
@@ -31,6 +37,16 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
+
+# --- Rate Limiting Configuration for YouTube Summarizer ---
+# Simple global rate limiting: max_requests in a time_window_seconds
+YOUTUBE_RATE_LIMIT_MAX_REQUESTS = 3 # Example: Allow 3 requests
+YOUTUBE_RATE_LIMIT_TIME_WINDOW_SECONDS = 60 # Example: per 60 seconds
+
+# Variables to track rate limit state
+youtube_request_count = 0
+youtube_last_reset_time = time.time()
+
 
 # --- LangChain Setup ---
 
@@ -190,8 +206,8 @@ def get_stock_data(symbol: str) -> str:
         volume = global_quote.get("06. volume", "N/A")
         latest_trading_day = global_quote.get("07. latest trading day", "N/A")
         previous_close = global_quote.get("08. previous close", "N/A")
-        change = global_quote.get("09. change", "N/A")
-        change_percent = global_quote.get("10. change percent", "N/A")
+        change = float(data.get("09. change", 0)) # Ensure change is float for analysis
+        change_percent = data.get("10. change percent", "0%")
 
         # Return as a JSON string to make parsing easier for analysis tool
         return json.dumps({
@@ -378,6 +394,106 @@ def generate_code_from_multiple_models(prompt: str) -> str:
 
     return output_string.strip()
 
+# --- Define YouTube Summarizer/Notes Tool ---
+def get_youtube_video_id(url: str) -> Union[str, None]:
+    """
+    Extracts the YouTube video ID from a given URL.
+    Supports various YouTube URL formats.
+    """
+    # Regex patterns for different YouTube URL formats
+    patterns = [
+        r"(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)",
+        r"(?:https?://)?(?:www\.)?youtu\.be/([a-zA-Z0-9_-]+)",
+        r"(?:https?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]+)",
+        r"(?:https?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]+)",
+        r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]+)"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def summarize_and_take_notes_youtube_video(video_url: str) -> Union[Dict[str, Any], str]:
+    """
+    Fetches the transcript of a YouTube video, summarizes it, and takes key notes using an LLM.
+    Requires a YouTube video URL as input.
+    Includes basic rate limiting.
+    Returns a dictionary containing 'summary' and 'notes' if successful, or a string error message.
+    """
+    global youtube_request_count, youtube_last_reset_time
+
+    # --- Apply Rate Limiting ---
+    current_time = time.time()
+    # Reset count if time window has passed
+    if current_time - youtube_last_reset_time > YOUTUBE_RATE_LIMIT_TIME_WINDOW_SECONDS:
+        youtube_request_count = 0
+        youtube_last_reset_time = current_time
+
+    # Check if rate limit is exceeded
+    if youtube_request_count >= YOUTUBE_RATE_LIMIT_MAX_REQUESTS:
+        wait_time = youtube_last_reset_time + YOUTUBE_RATE_LIMIT_TIME_WINDOW_SECONDS - current_time
+        return f"Rate limit exceeded for YouTube summarization and notes. Please wait {wait_time:.1f} seconds before trying again."
+
+    # Increment request count if within limit
+    youtube_request_count += 1
+    print(f"YouTube summarizer/notes request count: {youtube_request_count} in the current window.")
+    # --- End Rate Limiting ---
+
+
+    video_id = get_youtube_video_id(video_url)
+    if not video_id:
+        return "Could not extract a valid YouTube video ID from the provided URL. Please provide a valid YouTube video URL."
+
+    try:
+        # Get transcript
+        # Set languages to try, including English ('en') and potentially auto-generated ('a.en')
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'a.en'])
+        full_transcript = " ".join([entry['text'] for entry in transcript_list])
+
+        if not full_transcript.strip():
+            return "The YouTube video has no detectable transcript or the transcript is empty."
+
+        # Use an LLM to summarize and take notes from the transcript
+        if llm_gemini:
+            # Using a prompt that asks for both summary and notes
+            # Instruct the LLM to use clear markers for parsing
+            summarization_notes_prompt = PromptTemplate(
+                template="Summarize the following YouTube video transcript concisely and then provide key notes or bullet points from the content. Use '###SUMMARY###' before the summary and '###NOTES###' before the notes.\n\nTranscript:\n{transcript}\n\n---\n\n###SUMMARY###\n\n###NOTES###\n",
+                input_variables=["transcript"]
+            )
+            chain = summarization_notes_prompt | llm_gemini
+            summary_notes_result = chain.invoke({"transcript": full_transcript})
+
+            # Attempt to parse the response into summary and notes using markers
+            response_text = summary_notes_result.content if hasattr(summary_notes_result, 'content') else str(summary_notes_result)
+
+            summary = "Summary not found."
+            notes = "Notes not found."
+
+            summary_match = re.search(r"###SUMMARY###\s*(.*?)(?:\n###NOTES###|\Z)", response_text, re.DOTALL)
+            if summary_match:
+                summary = summary_match.group(1).strip()
+
+            notes_match = re.search(r"###NOTES###\s*(.*?)\Z", response_text, re.DOTALL)
+            if notes_match:
+                notes = notes_match.group(1).strip()
+
+            # Return a structured dictionary
+            return {"summary": summary, "notes": notes}
+
+        else:
+            return "Gemini LLM is not initialized, cannot summarize or take notes from the YouTube video. Please ensure GOOGLE_API_KEY is set."
+
+    except NoTranscriptFound:
+        return "No transcript found for this YouTube video. The video might not have captions, or they are not in an accessible format."
+    except TranscriptsDisabled:
+        return "Transcripts are disabled for this YouTube video by the creator."
+    except Exception as e:
+        print(f"Error summarizing/taking notes from YouTube video {video_id}: {e}")
+        # Provide a more specific error message for unexpected exceptions during transcript fetching
+        return f"An error occurred while fetching the YouTube transcript for video ID '{video_id}': {str(e)}. This might be due to YouTube blocking the request from your IP address or a temporary issue."
+
 
 # Create a list of tools the agent can use
 tools = []
@@ -407,7 +523,7 @@ if alpha_vantage_api_key: # Add Financial Data and Analysis Tools
     tools.append(Tool(
         name="Stock Analyzer",
         func=analyze_stock,
-        description="useful for analyzing real-time stock market data for a given ticker symbol and providing a brief summary. Input should be a stock ticker symbol, e.g., 'AAPL' or 'MSFT'."
+        description="useful for analyzing real-time stock market data for a given stock ticker symbol and providing a brief summary. Input should be a stock ticker symbol, e.g., 'AAPL' or 'MSFT'."
     ))
 else:
     print("Warning: Alpha Vantage API key is missing. Financial Data and Stock Analyzer tools will not be available.")
@@ -422,6 +538,16 @@ if llm_gemini or llm_claude or llm_openai or llm_deepseek:
 else:
     print("Warning: No code generation models (Gemini, Claude, OpenAI, DeepSeek) are available. Code Generator tool will not be added.")
 
+# Add the YouTube Summarizer/Notes tool
+if llm_gemini: # YouTube summarization depends on an initialized LLM, Gemini is preferred here
+    tools.append(Tool(
+        name="YouTube Summarizer/Notes",
+        func=summarize_and_take_notes_youtube_video,
+        description="useful for summarizing the content of a YouTube video and taking key notes. Input should be the full YouTube video URL, e.g., '[https://www.youtube.com/watch?v=exampleid](https://www.youtube.com/watch?v=exampleid)'. I will extract the transcript and provide a summary and notes in a structured format."
+    ))
+else:
+    print("Warning: Gemini LLM is not initialized. YouTube Summarizer/Notes tool will not be available.")
+
 
 # Updated base prefix to reinforce the multi-model nature of the code tool, financial data, and analysis
 base_personalized_prefix = """You are a helpful AI assistant with access to several tools to assist users with their queries.
@@ -430,11 +556,12 @@ You respond in a witty and playful tone.
 When asked about general knowledge or current events, use Google Search if available.
 When asked about live events like concerts or sports, use the Ticketmaster Event Search tool.
 When asked about medical or health-related topics, use the PubMed Search tool.
-When the user explicitly asks for code or a script, use the Code Generator tool. The input to the Code Generator should be the user's request for the code. This tool provides code results from multiple models (Gemini, Claude, OpenAI, DeepSeek).
+When the user explicitly asks for code or a script, use the Code Generator tool. The input to the Code Generator should be a clear description of the code needed. This tool provides code results from multiple models (Gemini, Claude, OpenAI, DeepSeek).
 When you use the Code Generator tool, you will receive output containing code generated by the available models, clearly labeled. Present ALL the code results you receive from the tool to the user. Before listing the code blocks, provide a brief explanation of the potential differences or characteristics you observe between the code generated by the different models, if multiple results are available. You can comment on style, structure, approach, or any other notable variations.
 When the user asks for *real-time financial data* for a specific stock, use the Financial Data tool. The input should be a stock ticker symbol (e.g., 'AAPL').
 When the user asks for an *analysis* or *insights* about a specific stock based on real-time data, use the Stock Analyzer tool. The input should be a stock ticker symbol (e.g., 'AAPL').
 When the user asks for *general financial advice* (e.g., "Should I invest in X?", "What's a good investment strategy?", "How do I save for retirement?"), leverage the Google Search tool to find general, reliable financial advice, and then summarize it. **Crucially, explicitly state that you are an AI and cannot provide personalized financial advice, and that they should consult a qualified financial advisor for their specific situation.**
+When the user provides a YouTube video URL and asks for a summary or notes, use the YouTube Summarizer/Notes tool. The input to this tool should be the full YouTube video URL.
 Always try to provide a concise and helpful answer based on the information you find or generate.
 
 Conversation History:
@@ -466,7 +593,8 @@ class AgentThoughtCallbackHandler(BaseCallbackHandler):
 
     def on_tool_end(self, output, **kwargs):
         # Capture the tool's output
-        self.thoughts.append(f"Tool Output: {output.strip()}")
+        # Store the raw output for potential parsing later
+        self.thoughts.append(f"Tool Output: {output}") # Store raw output
 
     # Removed on_llm_end to avoid capturing intermediate LLM calls within the agent's reasoning
     # The final result is captured directly from agent.invoke()
@@ -505,7 +633,85 @@ def perform_search():
 
         agent_thoughts = callback_handler.thoughts # Get the captured thoughts
 
-        # Check if the result contains the code generation marker
+        # --- Check for YouTube Summarizer/Notes Tool Output ---
+        # We need to inspect the tool output captured in the thoughts
+        youtube_tool_output = None
+        for thought in agent_thoughts:
+            if thought.startswith("Tool Output: "):
+                # Attempt to parse the tool output as JSON (dictionary)
+                try:
+                    # The tool output is stored as a string representation of the dictionary
+                    # We need to carefully extract and parse it.
+                    # A simple approach is to look for the start and end of the dictionary representation.
+                    # This is fragile and depends on the exact string format returned by the tool.
+                    # A more robust approach might involve the tool returning a specific marker + JSON string.
+                    # For now, let's assume the tool output string is the direct string representation of the dict or an error string.
+
+                    # Check if the output looks like our structured dictionary output
+                    # A simple check: does it contain "summary" and "notes" keys?
+                    if '"summary":' in thought and '"notes":' in thought:
+                         # Extract the dictionary string part
+                         json_string_match = re.search(r"(\{.*\})", thought, re.DOTALL)
+                         if json_string_match:
+                             json_string = json_string_match.group(1)
+                             youtube_tool_output = json.loads(json_string)
+                             print("Successfully parsed YouTube tool output as JSON.")
+                             break # Found the YouTube tool output, stop searching
+                         else:
+                             print("Could not find JSON string pattern in YouTube tool output.")
+                    elif "Rate limit exceeded" in thought or "No transcript found" in thought or "Transcripts are disabled" in thought or "An error occurred while fetching the YouTube transcript" in thought:
+                         # It's a known error message string from the YouTube tool
+                         youtube_tool_output = thought.replace("Tool Output: ", "").strip()
+                         print(f"Detected YouTube tool error message: {youtube_tool_output}")
+                         break # Found the YouTube tool output (error), stop searching
+
+
+                except json.JSONDecodeError as e:
+                    print(f"Could not decode YouTube tool output as JSON: {e}")
+                    # Keep youtube_tool_output as None, proceed to check for other response types
+                except Exception as e:
+                    print(f"An unexpected error occurred while processing YouTube tool output: {e}")
+                    # Keep youtube_tool_output as None
+
+
+        if youtube_tool_output and isinstance(youtube_tool_output, dict):
+            # It's a successful structured YouTube summary/notes response
+            summary = youtube_tool_output.get('summary', 'Summary not available.')
+            notes = youtube_tool_output.get('notes', 'Notes not available.')
+
+            updated_history_for_frontend = chat_history + [
+                {"sender": "user", "content": query},
+                # Store a simplified representation in history, frontend can render full details
+                {"sender": "assistant", "content": "Assistant provided YouTube summary and notes.", "type": "text"}
+            ]
+
+            # Prepare the response data structure for YouTube summary/notes
+            response_data = {
+                'type': 'youtube_summary_notes_response', # Indicate this is a YouTube summary/notes response
+                'summary': summary,
+                'notes': notes,
+                'updated_history': updated_history_for_frontend,
+                'agent_thoughts': agent_thoughts # Include agent thoughts
+            }
+
+            return jsonify(response_data)
+
+        elif youtube_tool_output and isinstance(youtube_tool_output, str):
+             # It's an error message string from the YouTube tool
+             updated_history_for_frontend = chat_history + [
+                {"sender": "user", "content": query},
+                {"sender": "assistant", "content": youtube_tool_output, "type": "text"} # Store the error message
+             ]
+
+             response_data = {
+                'type': 'text_response', # Treat error as a text response
+                'result': youtube_tool_output, # The error message
+                'updated_history': updated_history_for_frontend,
+                'agent_thoughts': agent_thoughts # Include agent thoughts
+            }
+             return jsonify(response_data)
+
+        # --- Check for Code Generation Output ---
         code_gen_marker = "###CODE_GENERATION_START###"
         if code_gen_marker in result:
             # Split the agent's response into introductory text and the raw code block output
@@ -571,7 +777,7 @@ def perform_search():
             return jsonify(code_response_data)
 
         else:
-            # If the code generation marker is not present, it's a regular text response from the agent
+            # If neither YouTube nor Code Generation output is detected, it's a regular text response
             updated_history_for_frontend = chat_history + [
                 {"sender": "user", "content": query},
                 {"sender": "assistant", "content": result, "type": "text"} # Store agent's text response, marked as text

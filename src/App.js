@@ -221,10 +221,6 @@ const customStyles = `
       ring-opacity: 50;
    }
 
-  .code-editor-copy-button svg {
-      margin-right: 0.25rem; /* mr-1 */
-  }
-
   .copy-success-message {
       font-size: 0.875rem; /* text-sm */
       color: #10b981; /* green-600 */
@@ -332,7 +328,7 @@ function App() {
         setIsSpeaking(false);
       }
     };
-  }, []); // Empty dependency array ensures this runs only once on mount
+  }, [synth]); // Added synth to dependency array
 
   // Handle sending the search query to the backend
   const handleSearch = async (searchQuery) => {
@@ -385,7 +381,20 @@ function App() {
               agent_thoughts: data.agent_thoughts || [] // Capture thoughts
             }
           ]);
-      } else if (data.type === 'text_response') {
+      } else if (data.type === 'youtube_summary_notes_response') {
+           // Handle the new YouTube summary/notes response type
+           setConversation(prevConv => [
+               ...prevConv,
+               {
+                   sender: 'assistant',
+                   type: 'youtube_summary_notes', // New type identifier for frontend rendering
+                   summary: data.summary,
+                   notes: data.notes,
+                   agent_thoughts: data.agent_thoughts || [] // Capture thoughts
+               }
+           ]);
+      }
+      else if (data.type === 'text_response') {
           // Add regular text response to conversation
           setConversation(prevConv => [
             ...prevConv,
@@ -488,7 +497,11 @@ function App() {
           textToSpeak += ` ${res.model} model reported a status: ${res.status.replace('_', ' ')}.`;
         }
       });
+    } else if (message.type === 'youtube_summary_notes') {
+        // For YouTube summary/notes, speak the summary and mention the notes
+        textToSpeak = `Here is the summary of the YouTube video: ${message.summary}. Key notes are also available.`;
     }
+
 
     if (!textToSpeak.trim()) {
       setIsSpeaking(false);
@@ -523,7 +536,11 @@ function App() {
         } else if (latestMessage.type === 'code' && (latestMessage.explanation.trim() || latestMessage.code_results.some(res => res.status === 'success' && res.content.trim()))) {
              // For code, speak if there's an explanation or at least one successful code result
             hasSpeakableContent = true;
+        } else if (latestMessage.type === 'youtube_summary_notes' && (latestMessage.summary.trim() || latestMessage.notes.trim())) {
+            // For YouTube summary/notes, speak if there's a summary or notes
+            hasSpeakableContent = true;
         }
+
 
         if (hasSpeakableContent) {
             readMessageContent(latestMessage);
@@ -686,12 +703,12 @@ function App() {
                 ${message.sender === 'user'
                   ? 'bg-blue-500 text-white' // User message style
                   : (message.sender === 'assistant'
-                    ? 'bg-gray-300 dark:bg-gray-600 text-gray-900 dark:text-gray-100' // Assistant text message style
+                    ? 'bg-gray-300 dark:bg-gray-600 text-gray-900 dark:text-gray-100' // Assistant message style
                     : 'bg-red-200 text-red-800 dark:bg-red-800 dark:text-red-200' // System/error message style
                   )
                 }
               `}>
-                {/* Render code response differently */}
+                {/* Render content based on message type */}
                 {message.sender === 'assistant' && message.type === 'code' ? (
                   <>
                     {/* Display explanation text if available */}
@@ -744,13 +761,27 @@ function App() {
                       </div>
                     ))}
                   </>
+                ) : message.sender === 'assistant' && message.type === 'youtube_summary_notes' ? (
+                   // Render YouTube summary and notes
+                   <div className="space-y-3">
+                       <div className="font-semibold text-lg">YouTube Summary:</div>
+                       <p className="whitespace-pre-wrap leading-relaxed">{message.summary}</p>
+                       {message.notes && message.notes.trim() && (
+                           <>
+                               <div className="font-semibold text-lg mt-4">Key Notes:</div>
+                               {/* Render notes, assuming they might be bullet points or lines */}
+                               <p className="whitespace-pre-wrap leading-relaxed">{message.notes}</p>
+                           </>
+                       )}
+                   </div>
                 ) : (
-                  // Render regular text message
+                  // Render regular text message (including system/error messages)
                   <p className="whitespace-pre-wrap leading-relaxed">{message.content}</p>
                 )}
 
+
                 {/* Display Agent Thoughts if available and toggled */}
-                {message.sender === 'assistant' && message.agent_thoughts && message.agent_thoughts.length > 0 && (
+                {message.agent_thoughts && message.agent_thoughts.length > 0 && (
                     <div className="mt-4 text-sm bg-gray-200 dark:bg-gray-700 p-2 rounded-lg">
                         <button
                             onClick={() => setShowThoughts(!showThoughts)}
@@ -827,8 +858,8 @@ function App() {
             {conversation.length > 0 && conversation[conversation.length - 1].sender === 'assistant' && (
                 <button
                   onClick={() => readMessageContent(conversation[conversation.length - 1])}
-                  className={`p-2 bg-green-600 text-white rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 transition duration-200 ease-in-out flex items-center shadow-sm ${(!synth || isMuted || isSpeaking || (conversation[conversation.length - 1].type === 'code' && !conversation[conversation.length - 1].explanation.trim() && !conversation[conversation.length - 1].code_results.some(res => res.status === 'success' && res.content.trim()))) ? 'opacity-60 cursor-not-allowed' : ''}`}
-                  disabled={!synth || isMuted || isSpeaking || (conversation[conversation.length - 1].type === 'code' && !conversation[conversation.length - 1].explanation.trim() && !conversation[conversation.length - 1].code_results.some(res => res.status === 'success' && res.content.trim()))}
+                  className={`p-2 bg-green-600 text-white rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 transition duration-200 ease-in-out flex items-center shadow-sm ${(!synth || isMuted || isSpeaking || (conversation[conversation.length - 1].type === 'code' && !conversation[conversation.length - 1].explanation.trim() && !conversation[conversation.length - 1].code_results.some(res => res.status === 'success' && res.content.trim())) || (conversation[conversation.length - 1].type === 'youtube_summary_notes' && !conversation[conversation.length - 1].summary.trim() && !conversation[conversation.length - 1].notes.trim())) ? 'opacity-60 cursor-not-allowed' : ''}`}
+                  disabled={!synth || isMuted || isSpeaking || (conversation[conversation.length - 1].type === 'code' && !conversation[conversation.length - 1].explanation.trim() && !conversation[conversation.length - 1].code_results.some(res => res.status === 'success' && res.content.trim())) || (conversation[conversation.length - 1].type === 'youtube_summary_notes' && !conversation[conversation.length - 1].summary.trim() && !conversation[conversation.length - 1].notes.trim())}
                   aria-label="Read aloud latest result"
                 >
                   <Volume2 size={20} className="mr-2"/> Read Aloud
@@ -839,14 +870,15 @@ function App() {
             {synth && (
               <div className="flex items-center space-x-2">
                 <VolumeX size={20} className="text-gray-700 dark:text-gray-300" />
-                <label className="toggle-switch" aria-label={isMuted ? "Toggle to unmute speech" : "Toggle to mute speech"}>
-                  <input type="checkbox" checked={!isMuted} onChange={toggleMute} />
+                <label className="toggle-switch">
+                  <input type="checkbox" checked={isMuted} onChange={toggleMute} aria-label="Toggle mute" />
                   <span className="slider"></span>
                 </label>
                 <Volume2 size={20} className="text-gray-700 dark:text-gray-300" />
               </div>
             )}
          </div>
+
       </div>
     </div>
   );
